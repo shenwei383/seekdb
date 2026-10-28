@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_expr_ai_complete.h"
+#include <cmath>
 #include "query/ai/ob_ai_endpoint_resolver.h"
 #include "share/rc/ob_server_runtime.h"
 
@@ -82,6 +83,34 @@ int ObExprAIComplete::calc_result_typeN(ObExprResType &type,
   return ret;
 }
 
+static int validate_complete_config(ObIAllocator &allocator, ObJsonObject *config)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(config)) {
+    if (OB_NOT_NULL(config->get_value("model")) ||
+        OB_NOT_NULL(config->get_value("messages"))) {
+      ret = OB_INVALID_ARGUMENT;
+    }
+    ObJsonNode *temperature = config->get_value("temperature");
+    if (OB_SUCC(ret) && OB_NOT_NULL(temperature)) {
+      float value = 0.0f;
+      share::ObJsonReaderHelper reader(allocator);
+      if (!share::ObJsonHelper::is_number_type(temperature) ||
+          OB_FAIL(reader.get_float_value(temperature, value)) ||
+          !std::isfinite(value) || value < 0.0f || value > 2.0f) {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    }
+    ObJsonNode *max_tokens = config->get_value("max_tokens");
+    if (OB_SUCC(ret) && OB_NOT_NULL(max_tokens) &&
+        (max_tokens->json_type() != ObJsonNodeType::J_INT ||
+         static_cast<ObJsonInt *>(max_tokens)->value() <= 0)) {
+      ret = OB_INVALID_ARGUMENT;
+    }
+  }
+  return ret;
+}
+
 int ObExprAIComplete::eval_ai_complete(const ObExpr &expr, 
                                        ObEvalCtx &ctx,
                                        ObDatum &res) 
@@ -117,25 +146,38 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
       ObJsonObject *prompt_object = nullptr;
       bool is_null = false;
       if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, PROMPT_IDX, j_base, is_null))) {
-      } else if (j_base->json_type() != ObJsonNodeType::J_OBJECT) {
+      } else if (is_null || OB_ISNULL(j_base) || j_base->json_type() != ObJsonNodeType::J_OBJECT) {
         ret = OB_INVALID_ARGUMENT;
       } else if (OB_FALSE_IT(prompt_object = static_cast<ObJsonObject *>(j_base))) {
       } else if (!ObAIFuncPromptObjectUtils::is_valid_prompt_object(prompt_object)) {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "prompt is not valid");
         res.set_null();
-      } else if (!ObAIFuncJsonUtils::ob_is_json_array_all_str(static_cast<ObJsonArray *>(prompt_object->get_value(ObAIFuncPromptObjectUtils::prompt_args_key)))) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "prompt object is not support");
       } else if (OB_FAIL(ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(temp_allocator, prompt_object, prompt))) {
       }
     } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_prompt, expr.args_[1]->datum_meta_, expr.args_[1]->obj_meta_.has_lob_header(), prompt))) {
     }
 
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_config)) {
-      if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
-      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
+    } else if (OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
+      if (expr.args_[CONFIG_IDX]->datum_meta_.type_ == ObJsonType) {
+        ObIJsonBase *config_base = nullptr;
+        bool is_null = false;
+        if (OB_FAIL(ObJsonExprHelper::get_json_doc(
+                expr, ctx, temp_allocator, CONFIG_IDX, config_base, is_null))) {
+        } else if (is_null || OB_ISNULL(config_base) ||
+                   config_base->json_type() != ObJsonNodeType::J_OBJECT) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          config = static_cast<ObJsonObject *>(config_base);
+        }
+      } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+                     ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[CONFIG_IDX]->datum_meta_,
+                     expr.args_[CONFIG_IDX]->obj_meta_.has_lob_header(), config_str))) {
+      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(
+                     temp_allocator, config_str, config))) {
+      }
+      if (OB_SUCC(ret) && OB_FAIL(validate_complete_config(temp_allocator, config))) {
       }
     }
 
