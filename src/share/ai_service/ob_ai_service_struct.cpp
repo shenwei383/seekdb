@@ -163,6 +163,11 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
       EXTRACT_JSON_ELEM_STR("scope", scope_)
       EXTRACT_JSON_ELEM_STR("ai_model_name", ai_model_name_)
       EXTRACT_JSON_ELEM_STR("url", url_)
+      if (elem.first.case_compare("access_key") == 0 &&
+          elem.second->json_type() == ObJsonNodeType::J_NULL) {
+        access_key_.reset();
+        has_api_key = true;
+      } else
       EXTRACT_JSON_ELEM_STR_WITH_PROCESS("access_key", access_key_, has_api_key = true)
       EXTRACT_JSON_ELEM_STR("provider", provider_)
       EXTRACT_JSON_ELEM_STR("request_model_name", request_model_name_)
