@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_ai_func_utils.h"
+#include <algorithm>
+#include <limits>
 #include "ob_ai_func_client.h"
 #include "query/engine/expr/ob_ai_model_resolver.h"
 
@@ -1620,10 +1622,7 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
     char *result_buf = NULL;
     for (uint64_t i = 0; OB_SUCC(ret) && i < args_count; i++) {
       ObJsonNode *arg_node = args_array->get_value(i);
-      if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_STRING) {
-        ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
-        max_result_len += arg_str->get_str().length();
-      } else {
+      if (OB_ISNULL(arg_node) || arg_node->json_type() != ObJsonNodeType::J_STRING) {
         ret = OB_INVALID_ARGUMENT;
       }
     }
@@ -1634,9 +1633,35 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
       int64_t result_pos = 0;
       const char *template_ptr = template_str.ptr();
       int64_t template_len = template_str.length();
-      
+      auto append_literal = [&](char value) {
+        if (result_pos >= max_result_len) {
+          if (max_result_len >= std::numeric_limits<int32_t>::max()) {
+            ret = OB_BUF_NOT_ENOUGH;
+          } else {
+            const int64_t new_len = std::min(
+                max_result_len * 2, static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+            char *new_buf = static_cast<char *>(allocator.alloc(new_len));
+            if (OB_ISNULL(new_buf)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              MEMCPY(new_buf, result_buf, result_pos);
+              result_buf = new_buf;
+              max_result_len = new_len;
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          result_buf[result_pos++] = value;
+        }
+      };
+
       for (int64_t i = 0; i < template_len && OB_SUCC(ret); i++) {
         if (template_ptr[i] == '{') {
+          if (i + 1 < template_len && template_ptr[i + 1] == '{') {
+            append_literal('{');
+            i++;
+            continue;
+          }
           int64_t start_pos = i;
           int64_t end_pos = start_pos;
           bool found_end = false;
@@ -1658,7 +1683,12 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
             bool valid_index = true;
             for (int64_t k = 0; k < index_str.length() && valid_index; k++) {
               if (index_str.ptr()[k] >= '0' && index_str.ptr()[k] <= '9') {
-                index = index * 10 + (index_str.ptr()[k] - '0');
+                int64_t digit = index_str.ptr()[k] - '0';
+                if (index > (std::numeric_limits<int64_t>::max() - digit) / 10) {
+                  valid_index = false;
+                } else {
+                  index = index * 10 + digit;
+                }
               } else {
                 valid_index = false;
               }
@@ -1670,11 +1700,27 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
                 ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
                 ObString arg_value = arg_str->get_str();
                 
-                if (result_pos + arg_value.length() <= max_result_len) {
-                  MEMCPY(result_buf + result_pos, arg_value.ptr(), arg_value.length());
-                  result_pos += arg_value.length();
-                } else {
+                if (arg_value.length() > std::numeric_limits<int32_t>::max() - result_pos) {
                   ret = OB_BUF_NOT_ENOUGH;
+                } else {
+                  const int64_t required_len = result_pos + arg_value.length();
+                  if (required_len > max_result_len) {
+                    const int64_t doubled_len = max_result_len > std::numeric_limits<int32_t>::max() / 2
+                        ? std::numeric_limits<int32_t>::max() : max_result_len * 2;
+                    const int64_t new_len = std::max(required_len, doubled_len);
+                    char *new_buf = static_cast<char *>(allocator.alloc(new_len));
+                    if (OB_ISNULL(new_buf)) {
+                      ret = OB_ALLOCATE_MEMORY_FAILED;
+                    } else {
+                      MEMCPY(new_buf, result_buf, result_pos);
+                      result_buf = new_buf;
+                      max_result_len = new_len;
+                    }
+                  }
+                  if (OB_SUCC(ret)) {
+                    MEMCPY(result_buf + result_pos, arg_value.ptr(), arg_value.length());
+                    result_pos = required_len;
+                  }
                 }
               } else {
                 //do nothing
@@ -1686,18 +1732,19 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
               LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_prompt: invalid placeholder index");
             }
           } else {
-            if (result_pos < max_result_len) {
-              result_buf[result_pos++] = template_ptr[i];
-            } else {
-              ret = OB_BUF_NOT_ENOUGH;
-            }
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_prompt: malformed placeholder");
+          }
+        } else if (template_ptr[i] == '}') {
+          if (i + 1 < template_len && template_ptr[i + 1] == '}') {
+            append_literal('}');
+            i++;
+          } else {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_prompt: malformed placeholder");
           }
         } else {
-          if (result_pos < max_result_len) {
-            result_buf[result_pos++] = template_ptr[i];
-          } else {
-            ret = OB_BUF_NOT_ENOUGH;
-          }
+          append_literal(template_ptr[i]);
         }
       }
       
