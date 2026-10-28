@@ -250,6 +250,11 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
       if (data_array->element_count() == 0) {
         ret = OB_INVALID_DATA;
       }
+      ObArray<ObJsonArray *> ordered;
+      for (int64_t i = 0; OB_SUCC(ret) && i < data_array->element_count(); ++i) {
+        if (OB_FAIL(ordered.push_back(nullptr))) {
+        }
+      }
       for (int64_t i = 0; OB_SUCC(ret) && i < data_array->element_count(); ++i) {
         ObJsonNode *data_item = data_array->get_value(i);
         if (OB_ISNULL(data_item) || data_item->json_type() != ObJsonNodeType::J_OBJECT) {
@@ -258,9 +263,11 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
           ObJsonObject *embedding_obj = static_cast<ObJsonObject *>(data_item);
           ObJsonNode *index_node = embedding_obj->get_value("index");
           ObJsonNode *embedding_node = embedding_obj->get_value("embedding");
-          if (OB_NOT_NULL(index_node) &&
-              (index_node->json_type() != ObJsonNodeType::J_INT ||
-               static_cast<ObJsonInt *>(index_node)->value() != i)) {
+          const int64_t index = OB_ISNULL(index_node) && data_array->element_count() == 1
+              ? 0 : OB_NOT_NULL(index_node) && index_node->json_type() == ObJsonNodeType::J_INT
+                  ? static_cast<ObJsonInt *>(index_node)->value() : -1;
+          if (index < 0 || index >= data_array->element_count() ||
+              OB_NOT_NULL(ordered.at(index))) {
             ret = OB_INVALID_DATA;
           } else if (OB_ISNULL(embedding_node) ||
                      embedding_node->json_type() != ObJsonNodeType::J_ARRAY) {
@@ -280,9 +287,16 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
                 ret = OB_INVALID_DATA;
               }
             }
-            if (OB_SUCC(ret) && OB_FAIL(result_array->append(embedding))) {
+            if (OB_SUCC(ret)) {
+              ordered.at(index) = embedding;
             }
           }
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < ordered.count(); ++i) {
+        if (OB_ISNULL(ordered.at(i))) {
+          ret = OB_INVALID_DATA;
+        } else if (OB_FAIL(result_array->append(ordered.at(i)))) {
         }
       }
       if (OB_SUCC(ret)) {
