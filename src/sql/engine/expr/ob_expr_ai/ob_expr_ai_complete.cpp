@@ -88,7 +88,9 @@ static int validate_complete_config(ObIAllocator &allocator, ObJsonObject *confi
   int ret = OB_SUCCESS;
   if (OB_NOT_NULL(config)) {
     if (OB_NOT_NULL(config->get_value("model")) ||
-        OB_NOT_NULL(config->get_value("messages"))) {
+        OB_NOT_NULL(config->get_value("messages")) ||
+        OB_NOT_NULL(config->get_value("prompt")) ||
+        OB_NOT_NULL(config->get_value("stream"))) {
       ret = OB_INVALID_ARGUMENT;
     }
     ObJsonNode *temperature = config->get_value("temperature");

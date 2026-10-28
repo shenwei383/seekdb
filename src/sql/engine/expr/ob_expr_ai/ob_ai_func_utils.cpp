@@ -297,7 +297,11 @@ int ObOllamaUtils::get_header(common::ObIAllocator &allocator,
                               common::ObArray<ObString> &headers) 
 {
   int ret = OB_SUCCESS;
-  // ollama header is empty, do nothing
+  ObString content_type("Content-Type: application/json");
+  ObString header;
+  if (OB_FAIL(ob_write_string(allocator, content_type, header, true))) {
+  } else if (OB_FAIL(headers.push_back(header))) {
+  }
   return ret;
 }
 
@@ -323,11 +327,14 @@ int ObOllamaUtils::ObOllamaComplete::get_body(common::ObIAllocator &allocator,
     ObJsonObject *body_obj = nullptr;
     ObJsonString *model_str = nullptr;
     ObJsonString *content_str = nullptr;
+    ObJsonBoolean *stream = nullptr;
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_object(allocator, body_obj))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, model, model_str))) {
     } else if (OB_FAIL(body_obj->add("model", model_str))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, content, content_str))) {
     } else if (OB_FAIL(body_obj->add("prompt", content_str))) {
+    } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_boolean(allocator, false, stream))) {
+    } else if (OB_FAIL(body_obj->add("stream", stream))) {
     } else if (OB_FAIL(ObAIFuncJsonUtils::compact_json_object(allocator, config, body_obj))) {
     } else {
       body = body_obj;
@@ -354,22 +361,18 @@ int ObOllamaUtils::ObOllamaComplete::set_config_json_format(common::ObIAllocator
 
 int ObOllamaUtils::ObOllamaComplete::parse_output(common::ObIAllocator &allocator,
                                                   common::ObJsonObject *http_response,
-                                                  common::ObIJsonBase *&result) 
+                                                  common::ObIJsonBase *&result)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(http_response)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    ObIJsonBase *j_tree = http_response;
-    common::ObString path_text("$.response");
-    ObJsonPath j_path(path_text, &allocator);
-    ObJsonSeekResult hit;
-    if (OB_FAIL(j_path.parse_path())) {
-    } else if (OB_FAIL(j_tree->seek(j_path, j_path.path_node_cnt(), false, false, hit))) {
-    } else if (hit.size() == 0) {
-      ret = OB_ERR_UNEXPECTED;
+    ObJsonNode *response = http_response->get_value("response");
+    if (OB_ISNULL(response) || response->json_type() != ObJsonNodeType::J_STRING ||
+        static_cast<ObJsonString *>(response)->get_str().empty()) {
+      ret = OB_INVALID_DATA;
     } else {
-      result = hit[0];
+      result = response;
     }
   }
   return ret;
@@ -413,22 +416,45 @@ int ObOllamaUtils::ObOllamaEmbed::get_body(common::ObIAllocator &allocator,
 
 int ObOllamaUtils::ObOllamaEmbed::parse_output(common::ObIAllocator &allocator,
                                                common::ObJsonObject *http_response,
-                                               common::ObIJsonBase *&result) 
+                                               common::ObIJsonBase *&result)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(http_response)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    ObIJsonBase *j_tree = http_response;
-    common::ObString path_text("$.embeddings");
-    ObJsonPath j_path(path_text, &allocator);
-    ObJsonSeekResult hit;
-    if (OB_FAIL(j_path.parse_path())) {
-    } else if (OB_FAIL(j_tree->seek(j_path, j_path.path_node_cnt(), false, false, hit))) {
-    } else if (hit.size() == 0) {
-      ret = OB_ERR_UNEXPECTED;
+    ObJsonNode *embeddings_node = http_response->get_value("embeddings");
+    if (OB_ISNULL(embeddings_node) || embeddings_node->json_type() != ObJsonNodeType::J_ARRAY) {
+      ret = OB_INVALID_DATA;
     } else {
-      result = hit[0];
+      ObJsonArray *embeddings = static_cast<ObJsonArray *>(embeddings_node);
+      share::ObJsonReaderHelper reader(allocator);
+      if (embeddings->element_count() == 0) {
+        ret = OB_INVALID_DATA;
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < embeddings->element_count(); ++i) {
+        ObJsonNode *embedding_node = embeddings->get_value(i);
+        if (OB_ISNULL(embedding_node) || embedding_node->json_type() != ObJsonNodeType::J_ARRAY) {
+          ret = OB_INVALID_DATA;
+        } else {
+          ObJsonArray *embedding = static_cast<ObJsonArray *>(embedding_node);
+          if (embedding->element_count() == 0) {
+            ret = OB_INVALID_DATA;
+          }
+          for (int64_t j = 0; OB_SUCC(ret) && j < embedding->element_count(); ++j) {
+            ObJsonNode *element = embedding->get_value(j);
+            float value = 0.0f;
+            if (!share::ObJsonHelper::is_number_type(element)) {
+              ret = OB_INVALID_DATA;
+            } else if (OB_FAIL(reader.get_float_value(element, value))) {
+            } else if (!std::isfinite(value)) {
+              ret = OB_INVALID_DATA;
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        result = embeddings;
+      }
     }
   }
   return ret;
@@ -1104,6 +1130,8 @@ int ObAIFuncUtils::get_complete_provider(ObIAllocator &allocator, const ObString
     complete_provider = OB_NEWx(ObOpenAIUtils::ObOpenAIComplete, &allocator);
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::DASHSCOPE)) {
     complete_provider = OB_NEWx(ObDashscopeUtils::ObDashscopeComplete, &allocator);
+  } else if (ob_provider_check(provider, ObAIFuncProviderUtils::OLLAMA)) {
+    complete_provider = OB_NEWx(ObOllamaUtils::ObOllamaComplete, &allocator);
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "this provider current is");
@@ -1127,6 +1155,8 @@ int ObAIFuncUtils::get_embed_provider(ObIAllocator &allocator, const ObString &p
     embed_provider = OB_NEWx(ObOpenAIUtils::ObOpenAIEmbed, &allocator);
   } else if (ob_provider_check(provider, ObAIFuncProviderUtils::DASHSCOPE)) {
     embed_provider = OB_NEWx(ObDashscopeUtils::ObDashscopeEmbed, &allocator);
+  } else if (ob_provider_check(provider, ObAIFuncProviderUtils::OLLAMA)) {
+    embed_provider = OB_NEWx(ObOllamaUtils::ObOllamaEmbed, &allocator);
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "this provider current is");
