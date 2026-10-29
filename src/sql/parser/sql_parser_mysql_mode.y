@@ -25,6 +25,7 @@
 }
 %{
 #include <stdint.h>
+#include <strings.h>
 #define YYDEBUG 1
 %}
 
@@ -10791,6 +10792,33 @@ table_factor:
 tbl_name
 {
   $$ = $1;
+}
+| NAME_OB '(' literal ')'
+{
+  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, $3, NULL);
+  $$->value_ = 1; // native CSV file table
+}
+| NAME_OB '(' literal ')' relation_name
+{
+  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, $3, $5);
+  $$->value_ = 1;
+}
+| NAME_OB '(' literal ')' AS relation_name
+{
+  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, $3, $6);
+  $$->value_ = 1;
 }
 | table_subquery
 {
