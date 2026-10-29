@@ -42,6 +42,7 @@
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
 #include "sql/engine/basic/ob_file_csv_scan.h"
+#include "sql/engine/basic/ob_file_json_scan.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string>
@@ -2703,6 +2704,8 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
           ret = OB_INVALID_ARGUMENT;
         } else if (table_node->value_ == 1 || table_node->value_ == 2) {
           OZ (resolve_file_csv_table_item(*table_node, table_item));
+        } else if (table_node->value_ >= 3 && table_node->value_ <= 6) {
+          OZ (resolve_file_json_table_item(*table_node, table_item));
         } else {
           OZ (resolve_function_table_item(*table_node, table_item));
         }
@@ -3927,6 +3930,156 @@ int ObDMLResolver::resolve_json_table_item(const ParseNode &parse_tree, TableIte
   } else if (OB_FAIL(resolve_json_table_column_item(*chil_col_node, item,
                                                     root_col_def, -1, id, cur_column_id))) {
   }
+  return ret;
+}
+
+int ObDMLResolver::resolve_file_json_options(const ParseNode &options, bool &format_seen,
+                                             bool &sample_seen)
+{
+  int ret = OB_SUCCESS;
+  if (options.type_ == T_EXPR_LIST && options.num_child_ == 2 &&
+      OB_NOT_NULL(options.children_[0]) && OB_NOT_NULL(options.children_[1])) {
+    if (OB_FAIL(resolve_file_json_options(*options.children_[0], format_seen, sample_seen))) {
+    } else if (OB_FAIL(resolve_file_json_options(*options.children_[1], format_seen, sample_seen))) {
+    }
+  } else if (options.type_ != T_LINK_NODE || options.num_child_ != 2 ||
+             OB_ISNULL(options.children_[0]) || OB_ISNULL(options.children_[1])) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ObRawExpr *value_expr = nullptr;
+    const ParseNode *name_node = options.children_[0];
+    const ObString name(name_node->str_len_, name_node->str_value_);
+    if (OB_FAIL(resolve_sql_expr(*options.children_[1], value_expr))) {
+    } else if (OB_ISNULL(value_expr) || !value_expr->is_const_expr()) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      const ObObj &value = static_cast<ObConstRawExpr *>(value_expr)->get_param();
+      if (name.case_compare("format") == 0) {
+        if (format_seen || !value.is_string_type() ||
+            (value.get_string().case_compare("newline_delimited") != 0 &&
+             value.get_string().case_compare("ndjson") != 0)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          format_seen = true;
+        }
+      } else if (name.case_compare("sample_size") == 0) {
+        if (sample_seen || !value.is_integer_type()) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (value.get_int() != -1) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_json requires full-file schema inference");
+        } else {
+          sample_seen = true;
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported read_json option");
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_file_json_table_item(const ParseNode &parse_tree,
+                                                TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  int64_t enabled = 0;
+  ObString secure_root;
+  ObRawExpr *path_expr = nullptr;
+  TableItem *item = nullptr;
+  ObDMLStmt *stmt = get_stmt();
+  char canonical[PATH_MAX + 1];
+  FileCsvSchema schema;
+  bool format_seen = false;
+  bool sample_seen = false;
+  const bool describe = parse_tree.value_ == 5 || parse_tree.value_ == 6;
+  const char *function_name = parse_tree.value_ == 4 || parse_tree.value_ == 6
+      ? "read_ndjson" : "read_json";
+  if (OB_ISNULL(session_info_) || OB_ISNULL(stmt) || OB_ISNULL(allocator_) ||
+      (parse_tree.num_child_ != 2 && parse_tree.num_child_ != 3) ||
+      OB_ISNULL(parse_tree.children_[0])) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (enabled == 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_json requires enable_file_sql=ON");
+  } else if (parse_tree.num_child_ == 3 &&
+             OB_FAIL(resolve_file_json_options(*parse_tree.children_[2], format_seen, sample_seen))) {
+  } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
+  } else if (OB_FAIL(resolve_sql_expr(*parse_tree.children_[0], path_expr))) {
+  } else if (OB_ISNULL(path_expr) || !path_expr->is_const_expr()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const ObObj &path_value = static_cast<ObConstRawExpr *>(path_expr)->get_param();
+    if (!path_value.is_string_type()) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      const ObString path = path_value.get_string();
+      const std::string path_string(path.ptr(), path.length());
+      if (nullptr == realpath(path_string.c_str(), canonical)) {
+        ret = OB_FILE_NOT_EXIST;
+      } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_root,
+                                                           ObString::make_string(canonical)))) {
+      } else {
+        const int fd = open_secure_csv_fd(
+            std::string(secure_root.ptr(), secure_root.length()), canonical);
+        if (fd < 0) {
+          ret = errno == ENOSYS ? OB_NOT_SUPPORTED : OB_ERR_NO_PRIVILEGE;
+        } else if (FileJsonScan::Status::OK != infer_json_schema_fd(fd, schema)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid JSONL file or changed during schema inference");
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      item->table_name_ = ObString::make_string(function_name);
+      item->file_json_ = true;
+      item->file_csv_describe_ = describe;
+      const ParseNode *alias = parse_tree.children_[1];
+      item->alias_name_ = alias == nullptr ? ObString::make_string(function_name) :
+          ObString(alias->str_len_, alias->str_value_);
+      item->table_id_ = generate_table_id();
+      item->type_ = TableItem::FUNCTION_TABLE;
+      item->function_table_expr_ = path_expr;
+      if (OB_FAIL(stmt->add_table_item(session_info_, item))) {
+      }
+    }
+  }
+  static const char *describe_columns[] = {
+      "column_name", "column_type", "null", "key", "default", "extra"};
+  const size_t column_count = describe ? 6 : schema.names.size();
+  for (size_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    const std::string name = describe ? describe_columns[i] : schema.names[i];
+    ObString name_copy;
+    ObString name_view(static_cast<int32_t>(name.size()), name.c_str());
+    ObObjMeta meta;
+    switch (describe ? FileCsvSchema::Kind::VARCHAR : schema.kinds[i]) {
+      case FileCsvSchema::Kind::BOOLEAN: meta.set_tinyint(); break;
+      case FileCsvSchema::Kind::BIGINT: meta.set_int(); break;
+      case FileCsvSchema::Kind::DOUBLE: meta.set_double(); break;
+      case FileCsvSchema::Kind::DATE: meta.set_date(); break;
+      case FileCsvSchema::Kind::DATETIME: meta.set_datetime(); break;
+      default:
+        meta.set_varchar();
+        meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+        meta.set_collation_level(CS_LEVEL_IMPLICIT);
+        break;
+    }
+    ColumnItem *column = nullptr;
+    ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[meta.get_type()];
+    if (!describe && schema.kinds[i] == FileCsvSchema::Kind::DATETIME)
+      accuracy.set_scale(schema.datetime_scales[i]);
+    if (OB_FAIL(ob_write_string(*allocator_, name_view, name_copy))) {
+    } else if (OB_FAIL(resolve_function_table_column_item(*item, meta, accuracy, name_copy,
+        OB_APP_MIN_COLUMN_ID + i, column))) {
+    }
+  }
+  if (OB_SUCC(ret)) table_item = item;
   return ret;
 }
 
@@ -7633,7 +7786,7 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
   CK (OB_LIKELY(table_item.is_function_table()));
   CK (OB_NOT_NULL(table_item.function_table_expr_));
   if (OB_SUCC(ret)) {
-    if (table_item.table_name_.case_compare("read_csv") == 0) {
+    if (table_item.table_name_.case_compare("read_csv") == 0 || table_item.file_json_) {
       ObDMLStmt *stmt = get_stmt();
       CK (OB_NOT_NULL(stmt));
       for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_column_size(); ++i) {

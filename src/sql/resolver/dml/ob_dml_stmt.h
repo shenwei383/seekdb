@@ -152,6 +152,7 @@ struct TableItem
     function_table_expr_ = nullptr;
     file_csv_header_ = true;
     file_csv_describe_ = false;
+    file_json_ = false;
     ddl_schema_version_ = 0;
     ddl_table_id_ = common::OB_INVALID_ID;
     json_table_def_ = nullptr;
@@ -297,6 +298,7 @@ struct TableItem
   ObRawExpr *function_table_expr_;
   bool file_csv_header_;
   bool file_csv_describe_;
+  bool file_json_;
   int64_t ddl_schema_version_;
   int64_t ddl_table_id_;
   // table partition

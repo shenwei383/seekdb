@@ -21,6 +21,7 @@
 #include "sql/engine/basic/ob_chunk_datum_store.h"
 #include "lib/charset/ob_charset.h"
 #include "sql/engine/basic/ob_file_csv_scan.h"
+#include "sql/engine/basic/ob_file_json_scan.h"
 
 namespace oceanbase
 {
@@ -33,7 +34,7 @@ class ObFunctionTableSpec : public ObOpSpec
 OB_UNIS_VERSION_V(1);
 public:
   ObFunctionTableSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
-    : ObOpSpec(alloc, type), value_expr_(nullptr), column_exprs_(alloc), has_correlated_expr_(false), file_csv_(false), file_csv_header_(true), file_csv_describe_(false)
+    : ObOpSpec(alloc, type), value_expr_(nullptr), column_exprs_(alloc), has_correlated_expr_(false), file_csv_(false), file_csv_header_(true), file_csv_describe_(false), file_json_(false)
   {}
   ObExpr *value_expr_;
   common::ObFixedArray<ObExpr*, common::ObIAllocator> column_exprs_;
@@ -41,6 +42,7 @@ public:
   bool file_csv_;
   bool file_csv_header_;
   bool file_csv_describe_;
+  bool file_json_;
 };
 
 class ObFunctionTableOp : public ObOperator
@@ -67,7 +69,10 @@ private:
   int inner_get_next_row_sys_func();
   int inner_get_next_row_csv();
   int inner_get_next_row_csv_metadata();
+  int inner_get_next_row_json();
   int open_csv();
+  int open_json();
+  int write_file_value(ObExpr *expr, const std::string &field, bool is_null);
   int get_current_result(common::ObObj &result);
   int64_t node_idx_;
   bool already_calc_;
@@ -79,6 +84,9 @@ private:
   std::vector<std::string> csv_row_;
   FileCsvSchema csv_metadata_schema_;
   bool csv_first_row_pending_;
+  FileJsonScan json_scan_;
+  FileCsvSchema json_schema_;
+  std::vector<FileJsonField> json_row_;
   int (ObFunctionTableOp::*next_row_func_)();
 };
 

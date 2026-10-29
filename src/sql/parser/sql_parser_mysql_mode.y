@@ -41,6 +41,11 @@
 #include "../../../src/sql/parser/sql_parser_mysql_mode_lex.h"
 #include "../../../src/sql/parser/sql_parser_base.h"
 
+#define FILE_TABLE_KIND(node) \
+  ((node)->str_len_ == 8 && strncasecmp((node)->str_value_, "read_csv", 8) == 0 ? 1 : \
+   (node)->str_len_ == 9 && strncasecmp((node)->str_value_, "read_json", 9) == 0 ? 3 : \
+   (node)->str_len_ == 11 && strncasecmp((node)->str_value_, "read_ndjson", 11) == 0 ? 4 : 0)
+
 #define GEN_EXPLAN_STMT(no_use, explain_stmt, explain_type, display_type, stmt, into_table, set_statement_id) \
   (void)(no_use); \
   ParseNode *type_node = NULL; \
@@ -10796,57 +10801,57 @@ tbl_name
 }
 | NAME_OB '(' literal ')'
 {
-  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+  if (FILE_TABLE_KIND($1) == 0) {
     yyerror(&@1, result, "unknown file table function");
     YYERROR;
   }
   malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, $3, NULL);
-  $$->value_ = 1; // native CSV file table
+  $$->value_ = FILE_TABLE_KIND($1);
 }
 | NAME_OB '(' literal ')' relation_name
 {
-  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+  if (FILE_TABLE_KIND($1) == 0) {
     yyerror(&@1, result, "unknown file table function");
     YYERROR;
   }
   malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, $3, $5);
-  $$->value_ = 1;
+  $$->value_ = FILE_TABLE_KIND($1);
 }
 | NAME_OB '(' literal ')' AS relation_name
 {
-  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+  if (FILE_TABLE_KIND($1) == 0) {
     yyerror(&@1, result, "unknown file table function");
     YYERROR;
   }
   malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, $3, $6);
-  $$->value_ = 1;
+  $$->value_ = FILE_TABLE_KIND($1);
 }
 | NAME_OB '(' literal ',' file_csv_options ')'
 {
-  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+  if (FILE_TABLE_KIND($1) == 0) {
     yyerror(&@1, result, "unknown file table function");
     YYERROR;
   }
   malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 3, $3, NULL, $5);
-  $$->value_ = 1;
+  $$->value_ = FILE_TABLE_KIND($1);
 }
 | NAME_OB '(' literal ',' file_csv_options ')' relation_name
 {
-  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+  if (FILE_TABLE_KIND($1) == 0) {
     yyerror(&@1, result, "unknown file table function");
     YYERROR;
   }
   malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 3, $3, $7, $5);
-  $$->value_ = 1;
+  $$->value_ = FILE_TABLE_KIND($1);
 }
 | NAME_OB '(' literal ',' file_csv_options ')' AS relation_name
 {
-  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+  if (FILE_TABLE_KIND($1) == 0) {
     yyerror(&@1, result, "unknown file table function");
     YYERROR;
   }
   malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 3, $3, $8, $5);
-  $$->value_ = 1;
+  $$->value_ = FILE_TABLE_KIND($1);
 }
 | table_subquery
 {
@@ -12345,8 +12350,8 @@ explain_or_desc relation_factor opt_desc_column_option
     source = source->children_[0];
   }
   if ($1 != NULL && source != NULL && source->type_ == T_TABLE_COLLECTION_EXPRESSION &&
-      source->value_ == 1) {
-    source->value_ = 2; // DESCRIBE CSV through the native function-table scan.
+      (source->value_ == 1 || source->value_ == 3 || source->value_ == 4)) {
+    source->value_ = source->value_ == 1 ? 2 : source->value_ + 2;
     $$ = $2;
   } else {
     GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);

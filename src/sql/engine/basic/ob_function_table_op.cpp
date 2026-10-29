@@ -34,7 +34,7 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_csv_, file_csv_header_, file_csv_describe_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_csv_, file_csv_header_, file_csv_describe_, file_json_);
 
 int ObFunctionTableOp::inner_open()
 {
@@ -46,6 +46,8 @@ int ObFunctionTableOp::inner_open()
     ret = OB_ERR_UNEXPECTED;
   } else if (MY_SPEC.file_csv_) {
     ret = open_csv();
+  } else if (MY_SPEC.file_json_) {
+    ret = open_json();
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
   } else {
@@ -70,6 +72,8 @@ int ObFunctionTableOp::inner_rescan()
       } else {
         csv_first_row_pending_ = !MY_SPEC.file_csv_describe_ && !MY_SPEC.file_csv_header_;
       }
+    } else if (MY_SPEC.file_json_ && FileJsonScan::Status::OK != json_scan_.rewind()) {
+      ret = OB_ERR_UNEXPECTED;
     }
     if (MY_SPEC.has_correlated_expr_) {
       row_count_ = 0;
@@ -91,6 +95,9 @@ int ObFunctionTableOp::inner_close()
   csv_scan_.close();
   csv_row_.clear();
   csv_metadata_schema_ = FileCsvSchema{};
+  json_scan_.close();
+  json_schema_ = FileCsvSchema{};
+  json_row_.clear();
   return ret;
 }
 
@@ -271,6 +278,53 @@ int ObFunctionTableOp::open_csv()
   return ret;
 }
 
+int ObFunctionTableOp::open_json()
+{
+  int ret = OB_SUCCESS;
+  int64_t enabled = 0;
+  ObString secure_root;
+  ObDatum *path_datum = nullptr;
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  char canonical[PATH_MAX + 1];
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (enabled == 0) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
+  } else if (OB_FAIL(MY_SPEC.value_expr_->eval(eval_ctx_, path_datum))) {
+  } else if (OB_ISNULL(path_datum) || path_datum->is_null()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const ObString path = path_datum->get_string();
+    const std::string path_string(path.ptr(), path.length());
+    if (nullptr == realpath(path_string.c_str(), canonical)) {
+      ret = OB_FILE_NOT_EXIST;
+    } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_root,
+                                                          ObString::make_string(canonical)))) {
+    } else {
+      const int fd = open_secure_csv_fd(
+          std::string(secure_root.ptr(), secure_root.length()), canonical);
+      if (fd < 0) {
+        ret = errno == ENOSYS ? OB_NOT_SUPPORTED : OB_ERR_NO_PRIVILEGE;
+      } else if (FileJsonScan::Status::OK != json_scan_.open_fd(fd)) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (FileJsonScan::Status::OK != infer_json_schema(json_scan_, json_schema_) ||
+                 FileJsonScan::Status::OK != json_scan_.rewind() ||
+                 static_cast<size_t>(MY_SPEC.column_exprs_.count()) !=
+                     (MY_SPEC.file_csv_describe_ ? 6 : json_schema_.names.size())) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (MY_SPEC.file_csv_describe_) {
+        csv_metadata_schema_ = json_schema_;
+        next_row_func_ = &ObFunctionTableOp::inner_get_next_row_csv_metadata;
+      } else {
+        next_row_func_ = &ObFunctionTableOp::inner_get_next_row_json;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObFunctionTableOp::inner_get_next_row_csv_metadata()
 {
   int ret = OB_SUCCESS;
@@ -314,6 +368,58 @@ int ObFunctionTableOp::inner_get_next_row_csv_metadata()
   return ret;
 }
 
+int ObFunctionTableOp::write_file_value(ObExpr *expr, const std::string &field, bool is_null)
+{
+  int ret = OB_SUCCESS;
+  ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+  if (is_null) {
+      datum.set_null();
+  } else if (expr->datum_meta_.type_ == ObIntType) {
+      char *end = nullptr;
+      errno = 0;
+      const int64_t value = std::strtoll(field.c_str(), &end, 10);
+      if (errno != 0 || end != field.c_str() + field.size()) ret = OB_INVALID_ARGUMENT;
+      else datum.set_int(value);
+  } else if (expr->datum_meta_.type_ == ObDoubleType) {
+      char *end = nullptr;
+      errno = 0;
+      const double value = std::strtod(field.c_str(), &end);
+      if (errno != 0 || end != field.c_str() + field.size()) ret = OB_INVALID_ARGUMENT;
+      else datum.set_double(value);
+  } else if (expr->datum_meta_.type_ == ObTinyIntType) {
+      if (field == "true") datum.set_int(1);
+      else if (field == "false") datum.set_int(0);
+      else ret = OB_INVALID_ARGUMENT;
+  } else if (expr->datum_meta_.type_ == ObDateType) {
+      int32_t value = 0;
+      ObDateSqlMode mode;
+      mode.allow_invalid_dates_ = false;
+      const ObString text(static_cast<int32_t>(field.size()), field.data());
+      if (OB_FAIL(ObTimeConverter::str_to_date(text, value, mode))) ret = OB_INVALID_ARGUMENT;
+      else datum.set_date(value);
+  } else if (expr->datum_meta_.type_ == ObDateTimeType) {
+      std::string normalized = field;
+      if (normalized.size() > 10 && normalized[10] == 'T') normalized[10] = ' ';
+      const ObString text(static_cast<int32_t>(normalized.size()), normalized.data());
+      ObDateSqlMode mode;
+      mode.allow_invalid_dates_ = false;
+      ObScale scale = 0;
+      int64_t value = 0;
+      ObTimeConvertCtx convert_ctx(nullptr, false);
+      if (OB_FAIL(ObTimeConverter::str_to_datetime(text, convert_ctx, value, &scale, mode)))
+        ret = OB_INVALID_ARGUMENT;
+      else datum.set_datetime(value);
+  } else if (field.empty()) {
+      datum.set_string("", 0);
+  } else {
+      char *buffer = expr->get_str_res_mem(eval_ctx_, field.size());
+      if (nullptr == buffer) ret = OB_ALLOCATE_MEMORY_FAILED;
+      else { std::memcpy(buffer, field.data(), field.size()); datum.set_string(buffer, field.size()); }
+  }
+  if (OB_SUCC(ret)) expr->set_evaluated_projected(eval_ctx_);
+  return ret;
+}
+
 int ObFunctionTableOp::inner_get_next_row_csv()
 {
   int ret = OB_SUCCESS;
@@ -328,52 +434,33 @@ int ObFunctionTableOp::inner_get_next_row_csv()
     ret = OB_INVALID_ARGUMENT;
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
-    ObExpr *expr = MY_SPEC.column_exprs_.at(i);
-    ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
     const std::string &field = csv_row_[i];
-    if (field.empty() || field == "NULL") {
-      datum.set_null();
-    } else if (expr->datum_meta_.type_ == ObIntType) {
-      char *end = nullptr;
-      errno = 0;
-      const int64_t value = std::strtoll(field.c_str(), &end, 10);
-      if (errno != 0 || end != field.c_str() + field.size()) ret = OB_INVALID_ARGUMENT;
-      else datum.set_int(value);
-    } else if (expr->datum_meta_.type_ == ObDoubleType) {
-      char *end = nullptr;
-      errno = 0;
-      const double value = std::strtod(field.c_str(), &end);
-      if (errno != 0 || end != field.c_str() + field.size()) ret = OB_INVALID_ARGUMENT;
-      else datum.set_double(value);
-    } else if (expr->datum_meta_.type_ == ObTinyIntType) {
-      if (field == "true") datum.set_int(1);
-      else if (field == "false") datum.set_int(0);
-      else ret = OB_INVALID_ARGUMENT;
-    } else if (expr->datum_meta_.type_ == ObDateType) {
-      int32_t value = 0;
-      ObDateSqlMode mode;
-      mode.allow_invalid_dates_ = false;
-      const ObString text(static_cast<int32_t>(field.size()), field.data());
-      if (OB_FAIL(ObTimeConverter::str_to_date(text, value, mode))) ret = OB_INVALID_ARGUMENT;
-      else datum.set_date(value);
-    } else if (expr->datum_meta_.type_ == ObDateTimeType) {
-      std::string normalized = field;
-      if (normalized.size() > 10 && normalized[10] == 'T') normalized[10] = ' ';
-      const ObString text(static_cast<int32_t>(normalized.size()), normalized.data());
-      ObDateSqlMode mode;
-      mode.allow_invalid_dates_ = false;
-      ObScale scale = 0;
-      int64_t value = 0;
-      ObTimeConvertCtx convert_ctx(nullptr, false);
-      if (OB_FAIL(ObTimeConverter::str_to_datetime(text, convert_ctx, value, &scale, mode)))
-        ret = OB_INVALID_ARGUMENT;
-      else datum.set_datetime(value);
-    } else {
-      char *buffer = expr->get_str_res_mem(eval_ctx_, field.size());
-      if (nullptr == buffer) ret = OB_ALLOCATE_MEMORY_FAILED;
-      else { std::memcpy(buffer, field.data(), field.size()); datum.set_string(buffer, field.size()); }
-    }
-    if (OB_SUCC(ret)) expr->set_evaluated_projected(eval_ctx_);
+    ret = write_file_value(MY_SPEC.column_exprs_.at(i), field,
+                           field.empty() || field == "NULL");
+  }
+  return ret;
+}
+
+int ObFunctionTableOp::inner_get_next_row_json()
+{
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  const FileJsonScan::Status status = json_scan_.next(json_row_);
+  if (status == FileJsonScan::Status::END) {
+    ret = OB_ITER_END;
+  } else if (status != FileJsonScan::Status::OK ||
+             static_cast<size_t>(MY_SPEC.column_exprs_.count()) != json_schema_.names.size()) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  const std::string empty;
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
+    const std::string &name = json_schema_.names[i];
+    const auto field = std::find_if(json_row_.begin(), json_row_.end(), [&name](const FileJsonField &item) {
+      return item.name == name;
+    });
+    const bool is_null = field == json_row_.end() || field->cell.is_null;
+    ret = write_file_value(MY_SPEC.column_exprs_.at(i),
+                           is_null ? empty : field->cell.text, is_null);
   }
   return ret;
 }
