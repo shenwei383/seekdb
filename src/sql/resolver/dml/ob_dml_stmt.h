@@ -153,6 +153,7 @@ struct TableItem
     file_csv_header_ = true;
     file_csv_describe_ = false;
     file_json_ = false;
+    file_parquet_ = false;
     ddl_schema_version_ = 0;
     ddl_table_id_ = common::OB_INVALID_ID;
     json_table_def_ = nullptr;
@@ -299,6 +300,7 @@ struct TableItem
   bool file_csv_header_;
   bool file_csv_describe_;
   bool file_json_;
+  bool file_parquet_;
   int64_t ddl_schema_version_;
   int64_t ddl_table_id_;
   // table partition

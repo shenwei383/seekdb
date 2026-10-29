@@ -5521,6 +5521,7 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
       spec.file_csv_header_ = table_item->file_csv_header_;
       spec.file_csv_describe_ = table_item->file_csv_describe_;
       spec.file_json_ = table_item->file_json_;
+      spec.file_parquet_ = table_item->file_parquet_;
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
       if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs().at(i)))) {

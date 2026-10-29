@@ -44,7 +44,8 @@
 #define FILE_TABLE_KIND(node) \
   ((node)->str_len_ == 8 && strncasecmp((node)->str_value_, "read_csv", 8) == 0 ? 1 : \
    (node)->str_len_ == 9 && strncasecmp((node)->str_value_, "read_json", 9) == 0 ? 3 : \
-   (node)->str_len_ == 11 && strncasecmp((node)->str_value_, "read_ndjson", 11) == 0 ? 4 : 0)
+   (node)->str_len_ == 11 && strncasecmp((node)->str_value_, "read_ndjson", 11) == 0 ? 4 : \
+   (node)->str_len_ == 12 && strncasecmp((node)->str_value_, "read_parquet", 12) == 0 ? 7 : 0)
 
 #define GEN_EXPLAN_STMT(no_use, explain_stmt, explain_type, display_type, stmt, into_table, set_statement_id) \
   (void)(no_use); \
@@ -12350,8 +12351,8 @@ explain_or_desc relation_factor opt_desc_column_option
     source = source->children_[0];
   }
   if ($1 != NULL && source != NULL && source->type_ == T_TABLE_COLLECTION_EXPRESSION &&
-      (source->value_ == 1 || source->value_ == 3 || source->value_ == 4)) {
-    source->value_ = source->value_ == 1 ? 2 : source->value_ + 2;
+      (source->value_ == 1 || source->value_ == 3 || source->value_ == 4 || source->value_ == 7)) {
+    source->value_ = source->value_ == 1 ? 2 : source->value_ == 7 ? 8 : source->value_ + 2;
     $$ = $2;
   } else {
     GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);

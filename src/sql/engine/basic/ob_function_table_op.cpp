@@ -34,7 +34,7 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_csv_, file_csv_header_, file_csv_describe_, file_json_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_csv_, file_csv_header_, file_csv_describe_, file_json_, file_parquet_);
 
 int ObFunctionTableOp::inner_open()
 {
@@ -48,6 +48,8 @@ int ObFunctionTableOp::inner_open()
     ret = open_csv();
   } else if (MY_SPEC.file_json_) {
     ret = open_json();
+  } else if (MY_SPEC.file_parquet_) {
+    ret = open_parquet();
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
   } else {
@@ -74,6 +76,8 @@ int ObFunctionTableOp::inner_rescan()
       }
     } else if (MY_SPEC.file_json_ && FileJsonScan::Status::OK != json_scan_.rewind()) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (MY_SPEC.file_parquet_ && FileParquetScan::Status::OK != parquet_scan_.rewind()) {
+      ret = OB_ERR_UNEXPECTED;
     }
     if (MY_SPEC.has_correlated_expr_) {
       row_count_ = 0;
@@ -98,6 +102,8 @@ int ObFunctionTableOp::inner_close()
   json_scan_.close();
   json_schema_ = FileCsvSchema{};
   json_row_.clear();
+  parquet_scan_.close();
+  parquet_row_.clear();
   return ret;
 }
 
@@ -325,6 +331,50 @@ int ObFunctionTableOp::open_json()
   return ret;
 }
 
+int ObFunctionTableOp::open_parquet()
+{
+  int ret = OB_SUCCESS;
+  int64_t enabled = 0;
+  ObString secure_root;
+  ObDatum *path_datum = nullptr;
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  char canonical[PATH_MAX + 1];
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (enabled == 0) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
+  } else if (OB_FAIL(MY_SPEC.value_expr_->eval(eval_ctx_, path_datum))) {
+  } else if (OB_ISNULL(path_datum) || path_datum->is_null()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const ObString path = path_datum->get_string();
+    const std::string path_string(path.ptr(), path.length());
+    if (nullptr == realpath(path_string.c_str(), canonical)) {
+      ret = OB_FILE_NOT_EXIST;
+    } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_root,
+                                                          ObString::make_string(canonical)))) {
+    } else {
+      const int fd = open_secure_csv_fd(
+          std::string(secure_root.ptr(), secure_root.length()), canonical);
+      if (fd < 0) {
+        ret = errno == ENOSYS ? OB_NOT_SUPPORTED : OB_ERR_NO_PRIVILEGE;
+      } else if (FileParquetScan::Status::OK != parquet_scan_.open_fd(fd) ||
+                 static_cast<size_t>(MY_SPEC.column_exprs_.count()) !=
+                     (MY_SPEC.file_csv_describe_ ? 6 : parquet_scan_.schema().names.size())) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (MY_SPEC.file_csv_describe_) {
+        csv_metadata_schema_ = parquet_scan_.schema();
+        next_row_func_ = &ObFunctionTableOp::inner_get_next_row_csv_metadata;
+      } else {
+        next_row_func_ = &ObFunctionTableOp::inner_get_next_row_parquet;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObFunctionTableOp::inner_get_next_row_csv_metadata()
 {
   int ret = OB_SUCCESS;
@@ -461,6 +511,24 @@ int ObFunctionTableOp::inner_get_next_row_json()
     const bool is_null = field == json_row_.end() || field->cell.is_null;
     ret = write_file_value(MY_SPEC.column_exprs_.at(i),
                            is_null ? empty : field->cell.text, is_null);
+  }
+  return ret;
+}
+
+int ObFunctionTableOp::inner_get_next_row_parquet()
+{
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  const FileParquetScan::Status status = parquet_scan_.next(parquet_row_);
+  if (status == FileParquetScan::Status::END) {
+    ret = OB_ITER_END;
+  } else if (status != FileParquetScan::Status::OK ||
+             static_cast<size_t>(MY_SPEC.column_exprs_.count()) != parquet_row_.size()) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
+    ret = write_file_value(MY_SPEC.column_exprs_.at(i), parquet_row_[i].text,
+                           parquet_row_[i].is_null);
   }
   return ret;
 }
