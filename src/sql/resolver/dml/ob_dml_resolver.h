@@ -208,6 +208,7 @@ public:
                                bool &header_seen, bool &sample_seen);
   int resolve_file_json_table_item(const ParseNode &table_node, TableItem *&table_item);
   int resolve_file_parquet_table_item(const ParseNode &table_node, TableItem *&table_item);
+  int resolve_file_glob_table_item(const ParseNode &table_node, TableItem *&table_item);
   int resolve_file_json_options(const ParseNode &options, bool &format_seen, bool &sample_seen);
   int resolve_function_table_item(const ParseNode &table_node,
                                   TableItem *&table_item);

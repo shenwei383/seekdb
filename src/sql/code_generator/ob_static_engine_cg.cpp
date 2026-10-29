@@ -5458,6 +5458,8 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_closed_cht(), spec.closed_cht_))) {
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_escaped_cht(), spec.escaped_cht_))) {
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
+  } else if (OB_FAIL(ob_write_string(alloc, op.get_copy_header(), spec.copy_header_))) {
+  } else if (OB_FAIL(deep_copy_obj(alloc, op.get_copy_nullstr(), spec.copy_nullstr_))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
   } else {
@@ -5479,6 +5481,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
     }
     if (OB_SUCC(ret)) {
       spec.into_type_ = op.get_into_type();
+      spec.file_sql_copy_ = op.get_file_sql_copy();
       spec.is_optional_ = op.get_is_optional();
       spec.is_single_ = op.get_is_single();
       spec.max_file_size_ = op.get_max_file_size();
@@ -5522,6 +5525,7 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
       spec.file_csv_describe_ = table_item->file_csv_describe_;
       spec.file_json_ = table_item->file_json_;
       spec.file_parquet_ = table_item->file_parquet_;
+      spec.file_glob_ = table_item->file_glob_;
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
       if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs().at(i)))) {

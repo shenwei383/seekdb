@@ -3107,6 +3107,48 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
       if (T_INTO_OUTFILE == node->type_) { // into outfile
         if (is_in_set_query()) {
           ret = OB_INAPPROPRIATE_INTO;
+        } else if (node->value_ == 1) { // COPY ... TO ... (FORMAT CSV, HEADER, NULLSTR ...)
+          int64_t enabled = 0;
+          ObObj nullstr_obj;
+          if (node->num_child_ != 3 || OB_ISNULL(node->children_[0]) ||
+              OB_ISNULL(node->children_[1])) {
+            ret = OB_INVALID_ARGUMENT;
+          } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+          } else if (enabled == 0) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY requires enable_file_sql=ON");
+          } else if (OB_FAIL(resolve_into_const_node(node->children_[0], into_item->outfile_name_))) {
+          } else if (OB_FAIL(resolve_into_const_node(node->children_[1], nullstr_obj))) {
+          } else if ((!into_item->outfile_name_.is_string_type() &&
+                      into_item->outfile_name_.get_type() != ObUnknownType) ||
+                     (!nullstr_obj.is_string_type() && nullstr_obj.get_type() != ObUnknownType)) {
+            ret = OB_INVALID_ARGUMENT;
+          } else {
+            into_item->copy_nullstr_ = nullstr_obj;
+            ObSqlString header;
+            const ObIArray<SelectItem> &items = select_stmt->get_select_items();
+            for (int64_t i = 0; OB_SUCC(ret) && i < items.count(); ++i) {
+              const ObString &name = items.at(i).alias_name_.empty()
+                                     ? items.at(i).expr_name_ : items.at(i).alias_name_;
+              if (i > 0 && OB_FAIL(header.append(","))) {
+              } else if (OB_FAIL(header.append("\""))) {
+              } else {
+                for (int64_t j = 0; OB_SUCC(ret) && j < name.length(); ++j) {
+                  if (name.ptr()[j] == '"' && OB_FAIL(header.append("\""))) {
+                  } else if (OB_FAIL(header.append_fmt("%c", name.ptr()[j]))) {
+                  }
+                }
+              }
+              if (OB_SUCC(ret) && OB_FAIL(header.append("\""))) {
+              }
+            }
+            if (OB_SUCC(ret) && OB_FAIL(header.append("\n"))) {
+            } else if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator_,
+                ObString(header.length(), header.ptr()), into_item->copy_header_))) {
+            } else if (OB_SUCC(ret)) {
+              into_item->file_sql_copy_ = true;
+            }
+          }
         } else if (node->num_child_ == 3 && NULL != node->children_[1]
             && T_EXTERNAL_FILE_FORMAT == node->children_[1]->type_) { // Handle with `FORMAT`
           if (OB_FAIL(resolve_into_outfile_with_format(node, *into_item))) {

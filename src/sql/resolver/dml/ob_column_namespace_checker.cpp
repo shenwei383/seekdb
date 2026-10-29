@@ -313,7 +313,7 @@ int ObColumnNamespaceChecker::check_column_exists(const TableItem &table_item, c
         table_id, col_name, is_exist))) {
     }
   } else if (table_item.is_function_table()) {
-    if (table_item.table_name_.case_compare("read_csv") == 0 || table_item.file_json_ || table_item.file_parquet_) {
+    if (table_item.table_name_.case_compare("read_csv") == 0 || table_item.file_json_ || table_item.file_parquet_ || table_item.file_glob_) {
       if (dml_stmt_ != nullptr) {
         for (int64_t i = 0; !is_exist && i < dml_stmt_->get_column_size(); ++i) {
           const ColumnItem *column = dml_stmt_->get_column_item(i);

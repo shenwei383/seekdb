@@ -45,7 +45,8 @@
   ((node)->str_len_ == 8 && strncasecmp((node)->str_value_, "read_csv", 8) == 0 ? 1 : \
    (node)->str_len_ == 9 && strncasecmp((node)->str_value_, "read_json", 9) == 0 ? 3 : \
    (node)->str_len_ == 11 && strncasecmp((node)->str_value_, "read_ndjson", 11) == 0 ? 4 : \
-   (node)->str_len_ == 12 && strncasecmp((node)->str_value_, "read_parquet", 12) == 0 ? 7 : 0)
+   (node)->str_len_ == 12 && strncasecmp((node)->str_value_, "read_parquet", 12) == 0 ? 7 : \
+   (node)->str_len_ == 4 && strncasecmp((node)->str_value_, "glob", 4) == 0 ? 9 : 0)
 
 #define GEN_EXPLAN_STMT(no_use, explain_stmt, explain_type, display_type, stmt, into_table, set_statement_id) \
   (void)(no_use); \
@@ -379,7 +380,7 @@ END_P SET_VAR DELIMITER
         ORGANIZATION
 //-----------------------------non_reserved keyword end---------------------------------------------
 %type <node> sql_stmt stmt_list stmt opt_end_p
-%type <node> select_stmt update_stmt delete_stmt
+%type <node> select_stmt copy_stmt update_stmt delete_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
 %type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt diff_table_stmt merge_table_stmt opt_table_option_list table_option_list table_option table_option_list_space_seperated parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> index_or_heap
@@ -564,6 +565,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8474,6 +8476,28 @@ select_no_parens into_clause
     } else {
       $$->children_[PARSE_SELECT_INTO_EXTRA] = $2;
     }
+  }
+}
+;
+
+// COPY reuses the SELECT INTO physical operator, with a distinct CSV option marker.
+copy_stmt:
+COPY '(' select_no_parens ')' TO STRING_VALUE
+  '(' FORMAT relation_name ',' relation_name ',' relation_name STRING_VALUE ')'
+{
+  if ($9->str_len_ != 3 || strncasecmp($9->str_value_, "csv", 3) != 0
+      || $11->str_len_ != 6 || strncasecmp($11->str_value_, "header", 6) != 0
+      || $13->str_len_ != 7 || strncasecmp($13->str_value_, "nullstr", 7) != 0
+      || $3->children_[PARSE_SELECT_INTO] != NULL
+      || $3->children_[PARSE_SELECT_INTO_EXTRA] != NULL) {
+    yyerror(&@1, result, "invalid COPY CSV options");
+    YYERROR;
+  } else {
+    ParseNode *into_node = NULL;
+    malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3, $6, $14, NULL);
+    into_node->value_ = 1;
+    $3->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+    $$ = $3;
   }
 }
 ;

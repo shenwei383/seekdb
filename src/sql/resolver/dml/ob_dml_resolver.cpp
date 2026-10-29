@@ -44,6 +44,7 @@
 #include "sql/engine/basic/ob_file_csv_scan.h"
 #include "sql/engine/basic/ob_file_json_scan.h"
 #include "sql/engine/basic/ob_file_parquet_scan.h"
+#include "sql/engine/basic/ob_file_glob_scan.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string>
@@ -2709,6 +2710,8 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
           OZ (resolve_file_json_table_item(*table_node, table_item));
         } else if (table_node->value_ == 7 || table_node->value_ == 8) {
           OZ (resolve_file_parquet_table_item(*table_node, table_item));
+        } else if (table_node->value_ == 9) {
+          OZ (resolve_file_glob_table_item(*table_node, table_item));
         } else {
           OZ (resolve_function_table_item(*table_node, table_item));
         }
@@ -4080,6 +4083,72 @@ int ObDMLResolver::resolve_file_json_table_item(const ParseNode &parse_tree,
     if (OB_FAIL(ob_write_string(*allocator_, name_view, name_copy))) {
     } else if (OB_FAIL(resolve_function_table_column_item(*item, meta, accuracy, name_copy,
         OB_APP_MIN_COLUMN_ID + i, column))) {
+    }
+  }
+  if (OB_SUCC(ret)) table_item = item;
+  return ret;
+}
+
+int ObDMLResolver::resolve_file_glob_table_item(const ParseNode &parse_tree,
+                                                TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  int64_t enabled = 0;
+  ObString secure_root;
+  ObRawExpr *path_expr = nullptr;
+  ObDMLStmt *stmt = get_stmt();
+  TableItem *item = nullptr;
+  if (OB_ISNULL(session_info_) || OB_ISNULL(stmt) || OB_ISNULL(allocator_) ||
+      parse_tree.num_child_ != 2 || OB_ISNULL(parse_tree.children_[0])) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (enabled == 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "glob requires enable_file_sql=ON");
+  } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
+  } else if (OB_FAIL(resolve_sql_expr(*parse_tree.children_[0], path_expr))) {
+  } else if (OB_ISNULL(path_expr) || !path_expr->is_const_expr()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const ObObj &value = static_cast<ObConstRawExpr *>(path_expr)->get_param();
+    if (!value.is_string_type()) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      FileGlobScan scan;
+      const ObString path = value.get_string();
+      const FileGlobScan::Status status = scan.open(
+          std::string(path.ptr(), path.length()),
+          std::string(secure_root.ptr(), secure_root.length()));
+      if (status == FileGlobScan::Status::DENIED) ret = OB_ERR_NO_PRIVILEGE;
+      else if (status != FileGlobScan::Status::OK) ret = OB_INVALID_ARGUMENT;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(item = stmt->create_table_item(*allocator_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      item->table_name_ = ObString::make_string("glob");
+      item->file_glob_ = true;
+      const ParseNode *alias = parse_tree.children_[1];
+      item->alias_name_ = alias == nullptr ? ObString::make_string("glob") :
+          ObString(alias->str_len_, alias->str_value_);
+      item->table_id_ = generate_table_id();
+      item->type_ = TableItem::FUNCTION_TABLE;
+      item->function_table_expr_ = path_expr;
+      if (OB_FAIL(stmt->add_table_item(session_info_, item))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObObjMeta meta;
+    meta.set_varchar();
+    meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    meta.set_collation_level(CS_LEVEL_IMPLICIT);
+    ColumnItem *column = nullptr;
+    const ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[meta.get_type()];
+    if (OB_FAIL(resolve_function_table_column_item(*item, meta, accuracy,
+                                                   ObString::make_string("file"),
+                                                   OB_APP_MIN_COLUMN_ID, column))) {
     }
   }
   if (OB_SUCC(ret)) table_item = item;
@@ -7888,7 +7957,7 @@ int ObDMLResolver::resolve_function_table_column_item(const TableItem &table_ite
   CK (OB_LIKELY(table_item.is_function_table()));
   CK (OB_NOT_NULL(table_item.function_table_expr_));
   if (OB_SUCC(ret)) {
-    if (table_item.table_name_.case_compare("read_csv") == 0 || table_item.file_json_ || table_item.file_parquet_) {
+    if (table_item.table_name_.case_compare("read_csv") == 0 || table_item.file_json_ || table_item.file_parquet_ || table_item.file_glob_) {
       ObDMLStmt *stmt = get_stmt();
       CK (OB_NOT_NULL(stmt));
       for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_column_size(); ++i) {

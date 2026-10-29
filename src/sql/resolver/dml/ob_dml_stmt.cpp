@@ -177,6 +177,7 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   file_csv_describe_ = other.file_csv_describe_;
   file_json_ = other.file_json_;
   file_parquet_ = other.file_parquet_;
+  file_glob_ = other.file_glob_;
   is_recursive_union_fake_table_ = other.is_recursive_union_fake_table_;
   cte_type_ = other.cte_type_;
   database_name_ = other.database_name_;

@@ -22,6 +22,7 @@
 #include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/engine/basic/ob_select_into_basic.h"
 #include "sql/engine/basic/ob_external_file_writer.h"
+#include "sql/engine/basic/ob_file_copy_writer.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
 
 namespace oceanbase
@@ -71,7 +72,10 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      file_sql_copy_(false),
+      copy_header_(),
+      copy_nullstr_()
   {
   }
 
@@ -91,6 +95,9 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  bool file_sql_copy_;
+  common::ObString copy_header_;
+  common::ObObj copy_nullstr_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -126,7 +133,11 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      copy_writer_(),
+      copy_finished_(false),
+      copy_row_count_(0),
+      copy_nullstr_value_()
   {
   }
 
@@ -256,6 +267,9 @@ private:
   int create_the_only_data_writer(ObExternalFileWriter *&data_writer);
   int new_data_writer(ObExternalFileWriter *&data_writer);
   int check_secure_file_path(ObString file_name);
+  int init_file_sql_copy();
+  int write_file_sql_copy_row();
+  int run_file_sql_copy();
   char *get_json_buf() { return json_buf_; }
   int64_t get_json_buf_len() { return json_buf_len_; }
   char *get_shared_buf() { return shared_buf_; }
@@ -292,6 +306,10 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  FileCopyWriter copy_writer_;
+  bool copy_finished_;
+  int64_t copy_row_count_;
+  common::ObString copy_nullstr_value_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

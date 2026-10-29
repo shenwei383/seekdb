@@ -34,7 +34,7 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_csv_, file_csv_header_, file_csv_describe_, file_json_, file_parquet_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_csv_, file_csv_header_, file_csv_describe_, file_json_, file_parquet_, file_glob_);
 
 int ObFunctionTableOp::inner_open()
 {
@@ -50,6 +50,8 @@ int ObFunctionTableOp::inner_open()
     ret = open_json();
   } else if (MY_SPEC.file_parquet_) {
     ret = open_parquet();
+  } else if (MY_SPEC.file_glob_) {
+    ret = open_glob();
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
   } else {
@@ -78,6 +80,8 @@ int ObFunctionTableOp::inner_rescan()
       ret = OB_ERR_UNEXPECTED;
     } else if (MY_SPEC.file_parquet_ && FileParquetScan::Status::OK != parquet_scan_.rewind()) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (MY_SPEC.file_glob_) {
+      glob_scan_.rewind();
     }
     if (MY_SPEC.has_correlated_expr_) {
       row_count_ = 0;
@@ -104,6 +108,7 @@ int ObFunctionTableOp::inner_close()
   json_row_.clear();
   parquet_scan_.close();
   parquet_row_.clear();
+  glob_scan_.close();
   return ret;
 }
 
@@ -375,6 +380,35 @@ int ObFunctionTableOp::open_parquet()
   return ret;
 }
 
+int ObFunctionTableOp::open_glob()
+{
+  int ret = OB_SUCCESS;
+  int64_t enabled = 0;
+  ObString secure_root;
+  ObDatum *path_datum = nullptr;
+  ObSQLSessionInfo *session = ctx_.get_my_session();
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (enabled == 0) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
+  } else if (OB_FAIL(MY_SPEC.value_expr_->eval(eval_ctx_, path_datum))) {
+  } else if (OB_ISNULL(path_datum) || path_datum->is_null()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const ObString pattern = path_datum->get_string();
+    const FileGlobScan::Status status = glob_scan_.open(
+        std::string(pattern.ptr(), pattern.length()),
+        std::string(secure_root.ptr(), secure_root.length()));
+    if (status == FileGlobScan::Status::DENIED) ret = OB_ERR_NO_PRIVILEGE;
+    else if (status != FileGlobScan::Status::OK) ret = OB_INVALID_ARGUMENT;
+    else if (MY_SPEC.column_exprs_.count() != 1) ret = OB_ERR_UNEXPECTED;
+    else next_row_func_ = &ObFunctionTableOp::inner_get_next_row_glob;
+  }
+  return ret;
+}
+
 int ObFunctionTableOp::inner_get_next_row_csv_metadata()
 {
   int ret = OB_SUCCESS;
@@ -529,6 +563,19 @@ int ObFunctionTableOp::inner_get_next_row_parquet()
   for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
     ret = write_file_value(MY_SPEC.column_exprs_.at(i), parquet_row_[i].text,
                            parquet_row_[i].is_null);
+  }
+  return ret;
+}
+
+int ObFunctionTableOp::inner_get_next_row_glob()
+{
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  std::string path;
+  if (!glob_scan_.next(path)) {
+    ret = OB_ITER_END;
+  } else {
+    ret = write_file_value(MY_SPEC.column_exprs_.at(0), path, false);
   }
   return ret;
 }
