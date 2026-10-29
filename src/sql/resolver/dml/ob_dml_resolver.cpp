@@ -2701,7 +2701,7 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
       case T_TABLE_COLLECTION_EXPRESSION: {
         if (OB_ISNULL(session_info_)) {
           ret = OB_INVALID_ARGUMENT;
-        } else if (table_node->value_ == 1) {
+        } else if (table_node->value_ == 1 || table_node->value_ == 2) {
           OZ (resolve_file_csv_table_item(*table_node, table_item));
         } else {
           OZ (resolve_function_table_item(*table_node, table_item));
@@ -3930,6 +3930,53 @@ int ObDMLResolver::resolve_json_table_item(const ParseNode &parse_tree, TableIte
   return ret;
 }
 
+int ObDMLResolver::resolve_file_csv_options(const ParseNode &options, bool &header,
+                                            bool &header_seen, bool &sample_seen)
+{
+  int ret = OB_SUCCESS;
+  if (options.type_ == T_EXPR_LIST && options.num_child_ == 2 &&
+      OB_NOT_NULL(options.children_[0]) && OB_NOT_NULL(options.children_[1])) {
+    if (OB_FAIL(resolve_file_csv_options(*options.children_[0], header, header_seen, sample_seen))) {
+    } else if (OB_FAIL(resolve_file_csv_options(*options.children_[1], header, header_seen, sample_seen))) {
+    }
+  } else if (options.type_ != T_LINK_NODE || options.num_child_ != 2 ||
+             OB_ISNULL(options.children_[0]) || OB_ISNULL(options.children_[1])) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ObRawExpr *value_expr = nullptr;
+    const ParseNode *name_node = options.children_[0];
+    const ObString name(name_node->str_len_, name_node->str_value_);
+    if (OB_FAIL(resolve_sql_expr(*options.children_[1], value_expr))) {
+    } else if (OB_ISNULL(value_expr) || !value_expr->is_const_expr()) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      const ObObj &value = static_cast<ObConstRawExpr *>(value_expr)->get_param();
+      if (name.case_compare("header") == 0) {
+        if (header_seen || !value.is_integer_type() ||
+            (value.get_int() != 0 && value.get_int() != 1)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          header = (value.get_int() == 1);
+          header_seen = true;
+        }
+      } else if (name.case_compare("sample_size") == 0) {
+        if (sample_seen || !value.is_integer_type()) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (value.get_int() != -1) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv requires full-file schema inference (sample_size=-1)");
+        } else {
+          sample_seen = true;
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "unsupported read_csv option");
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDMLResolver::resolve_file_csv_table_item(const ParseNode &parse_tree,
                                                    TableItem *&table_item)
 {
@@ -3941,13 +3988,20 @@ int ObDMLResolver::resolve_file_csv_table_item(const ParseNode &parse_tree,
   ObDMLStmt *stmt = get_stmt();
   char canonical[PATH_MAX + 1];
   FileCsvSchema schema;
+  bool header = true;
+  bool header_seen = false;
+  bool sample_seen = false;
   if (OB_ISNULL(session_info_) || OB_ISNULL(stmt) || OB_ISNULL(allocator_)
-      || parse_tree.num_child_ != 2 || OB_ISNULL(parse_tree.children_[0])) {
+      || (parse_tree.num_child_ != 2 && parse_tree.num_child_ != 3) ||
+      OB_ISNULL(parse_tree.children_[0])) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_ENABLE_FILE_SQL, enabled))) {
   } else if (enabled == 0) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv requires enable_file_sql=ON");
+  } else if (parse_tree.num_child_ == 3 &&
+             OB_FAIL(resolve_file_csv_options(*parse_tree.children_[2], header,
+                                               header_seen, sample_seen))) {
   } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_SECURE_FILE_PRIV, secure_root))) {
   } else if (OB_FAIL(resolve_sql_expr(*parse_tree.children_[0], path_expr))) {
   } else if (OB_ISNULL(path_expr) || !path_expr->is_const_expr()) {
@@ -3968,7 +4022,7 @@ int ObDMLResolver::resolve_file_csv_table_item(const ParseNode &parse_tree,
             std::string(secure_root.ptr(), secure_root.length()), canonical);
         if (fd < 0) {
           ret = errno == ENOSYS ? OB_NOT_SUPPORTED : OB_ERR_NO_PRIVILEGE;
-        } else if (FileCsvScan::Status::OK != infer_csv_schema_fd(fd, schema)) {
+        } else if (FileCsvScan::Status::OK != infer_csv_schema_fd(fd, schema, header)) {
           ret = OB_INVALID_ARGUMENT;
           LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid CSV file or changed during schema inference");
         }
@@ -3980,6 +4034,8 @@ int ObDMLResolver::resolve_file_csv_table_item(const ParseNode &parse_tree,
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       item->table_name_ = ObString("read_csv");
+      item->file_csv_header_ = header;
+      item->file_csv_describe_ = (parse_tree.value_ == 2);
       const ParseNode *alias = parse_tree.children_[1];
       item->alias_name_ = alias == nullptr ? ObString("read_csv") :
           ObString(alias->str_len_, alias->str_value_);
@@ -3990,15 +4046,20 @@ int ObDMLResolver::resolve_file_csv_table_item(const ParseNode &parse_tree,
       }
     }
   }
-  for (size_t i = 0; OB_SUCC(ret) && i < schema.names.size(); ++i) {
-    const std::string &name = schema.names[i];
+  static const char *describe_columns[] = {
+      "column_name", "column_type", "null", "key", "default", "extra"};
+  const size_t column_count = parse_tree.value_ == 2 ? 6 : schema.names.size();
+  for (size_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    const std::string name = parse_tree.value_ == 2 ? describe_columns[i] : schema.names[i];
     ObString name_copy;
     ObString name_view(static_cast<int32_t>(name.size()), name.c_str());
     ObObjMeta meta;
-    switch (schema.kinds[i]) {
+    switch (parse_tree.value_ == 2 ? FileCsvSchema::Kind::VARCHAR : schema.kinds[i]) {
       case FileCsvSchema::Kind::BOOLEAN: meta.set_tinyint(); break;
       case FileCsvSchema::Kind::BIGINT: meta.set_int(); break;
       case FileCsvSchema::Kind::DOUBLE: meta.set_double(); break;
+      case FileCsvSchema::Kind::DATE: meta.set_date(); break;
+      case FileCsvSchema::Kind::DATETIME: meta.set_datetime(); break;
       default:
         meta.set_varchar();
         meta.set_collation_type(CS_TYPE_UTF8MB4_BIN);
@@ -4006,9 +4067,13 @@ int ObDMLResolver::resolve_file_csv_table_item(const ParseNode &parse_tree,
         break;
     }
     ColumnItem *column = nullptr;
+    ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[meta.get_type()];
+    if (parse_tree.value_ != 2 && schema.kinds[i] == FileCsvSchema::Kind::DATETIME) {
+      accuracy.set_scale(schema.datetime_scales[i]);
+    }
     if (OB_FAIL(ob_write_string(*allocator_, name_view, name_copy))) {
     } else if (OB_FAIL(resolve_function_table_column_item(*item, meta,
-        ObAccuracy::DDL_DEFAULT_ACCURACY[meta.get_type()], name_copy,
+        accuracy, name_copy,
         OB_APP_MIN_COLUMN_ID + i, column))) {
     }
   }

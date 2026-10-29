@@ -21,6 +21,7 @@
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/session/ob_sql_session_info.h"
+#include "common/timezone/ob_time_convert.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <cerrno>
@@ -33,13 +34,14 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_csv_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_csv_, file_csv_header_, file_csv_describe_);
 
 int ObFunctionTableOp::inner_open()
 {
   int ret = OB_SUCCESS;
   node_idx_ = 0;
   already_calc_ = false;
+  csv_first_row_pending_ = false;
   if (OB_ISNULL(MY_SPEC.value_expr_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (MY_SPEC.file_csv_) {
@@ -60,9 +62,13 @@ int ObFunctionTableOp::inner_rescan()
     node_idx_ = 0;
     if (MY_SPEC.file_csv_) {
       csv_row_.clear();
-      if (FileCsvScan::Status::OK != csv_scan_.rewind() ||
+      if (FileCsvScan::Status::OK != csv_scan_.rewind()) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!MY_SPEC.file_csv_describe_ &&
           FileCsvScan::Status::OK != csv_scan_.next(csv_row_)) {
         ret = OB_ERR_UNEXPECTED;
+      } else {
+        csv_first_row_pending_ = !MY_SPEC.file_csv_describe_ && !MY_SPEC.file_csv_header_;
       }
     }
     if (MY_SPEC.has_correlated_expr_) {
@@ -84,6 +90,7 @@ int ObFunctionTableOp::inner_close()
   value_table_ = NULL;
   csv_scan_.close();
   csv_row_.clear();
+  csv_metadata_schema_ = FileCsvSchema{};
   return ret;
 }
 
@@ -244,10 +251,19 @@ int ObFunctionTableOp::open_csv()
         ret = errno == ENOSYS ? OB_NOT_SUPPORTED : OB_ERR_NO_PRIVILEGE;
       } else if (FileCsvScan::Status::OK != csv_scan_.open_fd(fd)) {
         ret = OB_INVALID_ARGUMENT;
+      } else if (MY_SPEC.file_csv_describe_) {
+        if (MY_SPEC.column_exprs_.count() != 6 ||
+            FileCsvScan::Status::OK != infer_csv_schema(csv_scan_, csv_metadata_schema_,
+                                                        MY_SPEC.file_csv_header_)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          next_row_func_ = &ObFunctionTableOp::inner_get_next_row_csv_metadata;
+        }
       } else if (FileCsvScan::Status::OK != csv_scan_.next(csv_row_) ||
                  csv_row_.size() != static_cast<size_t>(MY_SPEC.column_exprs_.count())) {
         ret = OB_INVALID_ARGUMENT;
       } else {
+        csv_first_row_pending_ = !MY_SPEC.file_csv_header_;
         next_row_func_ = &ObFunctionTableOp::inner_get_next_row_csv;
       }
     }
@@ -255,11 +271,56 @@ int ObFunctionTableOp::open_csv()
   return ret;
 }
 
+int ObFunctionTableOp::inner_get_next_row_csv_metadata()
+{
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  if (node_idx_ >= static_cast<int64_t>(csv_metadata_schema_.names.size())) {
+    ret = OB_ITER_END;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
+    ObExpr *expr = MY_SPEC.column_exprs_.at(i);
+    ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+    const char *value = nullptr;
+    if (i == 0) {
+      value = csv_metadata_schema_.names[node_idx_].c_str();
+    } else if (i == 1) {
+      switch (csv_metadata_schema_.kinds[node_idx_]) {
+        case FileCsvSchema::Kind::BOOLEAN: value = "BOOLEAN"; break;
+        case FileCsvSchema::Kind::BIGINT: value = "BIGINT"; break;
+        case FileCsvSchema::Kind::DOUBLE: value = "DOUBLE"; break;
+        case FileCsvSchema::Kind::DATE: value = "DATE"; break;
+        case FileCsvSchema::Kind::DATETIME: value = "DATETIME"; break;
+        default: value = "VARCHAR"; break;
+      }
+    } else if (i == 2) {
+      value = csv_metadata_schema_.nullable[node_idx_] ? "YES" : "NO";
+    }
+    if (value == nullptr) {
+      datum.set_null();
+    } else {
+      const size_t length = std::strlen(value);
+      char *buffer = expr->get_str_res_mem(eval_ctx_, length);
+      if (buffer == nullptr) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        std::memcpy(buffer, value, length);
+        datum.set_string(buffer, length);
+      }
+    }
+    if (OB_SUCC(ret)) expr->set_evaluated_projected(eval_ctx_);
+  }
+  if (OB_SUCC(ret)) ++node_idx_;
+  return ret;
+}
+
 int ObFunctionTableOp::inner_get_next_row_csv()
 {
   int ret = OB_SUCCESS;
   clear_evaluated_flag();
-  const FileCsvScan::Status status = csv_scan_.next(csv_row_);
+  const FileCsvScan::Status status = csv_first_row_pending_
+      ? FileCsvScan::Status::OK : csv_scan_.next(csv_row_);
+  csv_first_row_pending_ = false;
   if (status == FileCsvScan::Status::END) {
     ret = OB_ITER_END;
   } else if (status != FileCsvScan::Status::OK ||
@@ -288,6 +349,25 @@ int ObFunctionTableOp::inner_get_next_row_csv()
       if (field == "true") datum.set_int(1);
       else if (field == "false") datum.set_int(0);
       else ret = OB_INVALID_ARGUMENT;
+    } else if (expr->datum_meta_.type_ == ObDateType) {
+      int32_t value = 0;
+      ObDateSqlMode mode;
+      mode.allow_invalid_dates_ = false;
+      const ObString text(static_cast<int32_t>(field.size()), field.data());
+      if (OB_FAIL(ObTimeConverter::str_to_date(text, value, mode))) ret = OB_INVALID_ARGUMENT;
+      else datum.set_date(value);
+    } else if (expr->datum_meta_.type_ == ObDateTimeType) {
+      std::string normalized = field;
+      if (normalized.size() > 10 && normalized[10] == 'T') normalized[10] = ' ';
+      const ObString text(static_cast<int32_t>(normalized.size()), normalized.data());
+      ObDateSqlMode mode;
+      mode.allow_invalid_dates_ = false;
+      ObScale scale = 0;
+      int64_t value = 0;
+      ObTimeConvertCtx convert_ctx(nullptr, false);
+      if (OB_FAIL(ObTimeConverter::str_to_datetime(text, convert_ctx, value, &scale, mode)))
+        ret = OB_INVALID_ARGUMENT;
+      else datum.set_datetime(value);
     } else {
       char *buffer = expr->get_str_res_mem(eval_ctx_, field.size());
       if (nullptr == buffer) ret = OB_ALLOCATE_MEMORY_FAILED;

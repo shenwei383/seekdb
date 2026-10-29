@@ -407,6 +407,7 @@ END_P SET_VAR DELIMITER
 %type <node> sort_list sort_key opt_asc_desc sort_list_for_group_by sort_key_for_group_by opt_asc_desc_for_group_by sort_list_opt_null sort_key_opt_null opt_asc_desc_null
 %type <node> opt_query_expression_option_list query_expression_option_list query_expression_option opt_distinct opt_distinct_or_all opt_separator projection
 %type <node> from_list table_references table_reference table_factor normal_relation_factor dot_relation_factor relation_factor
+%type <node> file_csv_options file_csv_option
 %type <node> relation_factor_in_hint relation_factor_in_hint_list relation_factor_in_pq_hint opt_relation_factor_in_hint_list relation_factor_in_use_join_hint_list
 %type <node> relation_factor_in_leading_hint_list joined_table tbl_name table_subquery table_subquery_alias
 %type <node> relation_factor_with_star relation_with_star_list opt_with_star
@@ -10820,6 +10821,33 @@ tbl_name
   malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 2, $3, $6);
   $$->value_ = 1;
 }
+| NAME_OB '(' literal ',' file_csv_options ')'
+{
+  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 3, $3, NULL, $5);
+  $$->value_ = 1;
+}
+| NAME_OB '(' literal ',' file_csv_options ')' relation_name
+{
+  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 3, $3, $7, $5);
+  $$->value_ = 1;
+}
+| NAME_OB '(' literal ',' file_csv_options ')' AS relation_name
+{
+  if ($1->str_len_ != 8 || strncasecmp($1->str_value_, "read_csv", 8) != 0) {
+    yyerror(&@1, result, "unknown file table function");
+    YYERROR;
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_TABLE_COLLECTION_EXPRESSION, 3, $3, $8, $5);
+  $$->value_ = 1;
+}
 | table_subquery
 {
   $$ = $1;
@@ -10875,6 +10903,21 @@ tbl_name
 | hybrid_search_expr
 {
   $$ = $1;
+}
+;
+
+file_csv_options:
+file_csv_option { $$ = $1; }
+| file_csv_options ',' file_csv_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $3);
+}
+;
+
+file_csv_option:
+relation_name COMP_EQ signed_literal
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
 }
 ;
 
@@ -12293,7 +12336,22 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt
+{
+  ParseNode *from = $2->type_ == T_SELECT ? $2->children_[PARSE_SELECT_FROM] : NULL;
+  ParseNode *source = from != NULL && from->type_ == T_FROM_LIST && from->num_child_ == 1
+      ? from->children_[0] : NULL;
+  if (source != NULL && source->type_ == T_ALIAS && source->num_child_ == 2) {
+    source = source->children_[0];
+  }
+  if ($1 != NULL && source != NULL && source->type_ == T_TABLE_COLLECTION_EXPRESSION &&
+      source->value_ == 1) {
+    source->value_ = 2; // DESCRIBE CSV through the native function-table scan.
+    $$ = $2;
+  } else {
+    GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);
+  }
+}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12334,8 +12392,8 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE {malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 1;}
+| DESC  {malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 1;}
 ;
 
 explainable_stmt:

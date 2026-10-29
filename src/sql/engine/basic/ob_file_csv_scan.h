@@ -212,16 +212,53 @@ private:
 
 
 struct FileCsvSchema {
-  enum class Kind { UNKNOWN, BOOLEAN, BIGINT, DOUBLE, VARCHAR };
+  enum class Kind { UNKNOWN, BOOLEAN, BIGINT, DOUBLE, DATE, DATETIME, VARCHAR };
   std::vector<std::string> names;
   std::vector<Kind> kinds;
+  std::vector<int8_t> datetime_scales;
+  std::vector<bool> nullable;
   size_t rows = 0;
 };
+
+inline bool csv_digit(char ch) { return ch >= '0' && ch <= '9'; }
+
+inline bool csv_date_prefix(const std::string &value)
+{
+  if (value.size() < 10 || value[4] != '-' || value[7] != '-') return false;
+  for (size_t i = 0; i < 10; ++i)
+    if (i != 4 && i != 7 && !csv_digit(value[i])) return false;
+  const int year = std::atoi(value.substr(0, 4).c_str());
+  const int month = std::atoi(value.substr(5, 2).c_str());
+  const int day = std::atoi(value.substr(8, 2).c_str());
+  if (year < 1 || month < 1 || month > 12) return false;
+  const int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  const bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+  return day >= 1 && day <= days[month - 1] + (month == 2 && leap ? 1 : 0);
+}
+
+inline bool csv_datetime_value(const std::string &value)
+{
+  if (value.size() < 19 || !csv_date_prefix(value) ||
+      (value[10] != ' ' && value[10] != 'T') ||
+      value[13] != ':' || value[16] != ':') return false;
+  for (size_t i = 11; i < 19; ++i)
+    if (i != 13 && i != 16 && !csv_digit(value[i])) return false;
+  if (std::atoi(value.substr(11, 2).c_str()) > 23 ||
+      std::atoi(value.substr(14, 2).c_str()) > 59 ||
+      std::atoi(value.substr(17, 2).c_str()) > 59) return false;
+  if (value.size() == 19) return true;
+  if (value[19] != '.' || value.size() > 26 || value.size() == 20) return false;
+  for (size_t i = 20; i < value.size(); ++i)
+    if (!csv_digit(value[i])) return false;
+  return true;
+}
 
 inline FileCsvSchema::Kind classify_csv_value(const std::string &value)
 {
   if (value.empty() || value == "NULL") return FileCsvSchema::Kind::UNKNOWN;
   if (value == "true" || value == "false") return FileCsvSchema::Kind::BOOLEAN;
+  if (value.size() == 10 && csv_date_prefix(value)) return FileCsvSchema::Kind::DATE;
+  if (csv_datetime_value(value)) return FileCsvSchema::Kind::DATETIME;
   char *end = nullptr;
   errno = 0;
   std::strtoll(value.c_str(), &end, 10);
@@ -233,7 +270,8 @@ inline FileCsvSchema::Kind classify_csv_value(const std::string &value)
   return FileCsvSchema::Kind::VARCHAR;
 }
 
-inline FileCsvScan::Status infer_csv_schema(FileCsvScan &scan, FileCsvSchema &schema)
+inline FileCsvScan::Status infer_csv_schema(FileCsvScan &scan, FileCsvSchema &schema,
+                                           bool header = true)
 {
   schema = FileCsvSchema{};
   FileCsvScan::Status status = FileCsvScan::Status::OK;
@@ -242,18 +280,26 @@ inline FileCsvScan::Status infer_csv_schema(FileCsvScan &scan, FileCsvSchema &sc
   if (status != FileCsvScan::Status::OK || row.empty()) return FileCsvScan::Status::INVALID;
   if (row[0].size() >= 3 && row[0].compare(0, 3, "\xef\xbb\xbf") == 0) row[0].erase(0, 3);
   std::map<std::string, size_t> seen;
-  for (std::string &name : row) {
+  for (size_t i = 0; i < row.size(); ++i) {
+    std::string name = header ? row[i] : "column" + std::to_string(i);
     if (name.empty() || schema.names.size() >= 1024) return FileCsvScan::Status::INVALID;
     const size_t index = ++seen[name];
     if (index > 1) name += "__" + std::to_string(index);
     schema.names.push_back(name);
     schema.kinds.push_back(FileCsvSchema::Kind::UNKNOWN);
+    schema.datetime_scales.push_back(0);
+    schema.nullable.push_back(false);
   }
-  while ((status = scan.next(row)) == FileCsvScan::Status::OK) {
-    if (row.size() != schema.names.size()) return FileCsvScan::Status::INVALID;
+  const auto accept_row = [&schema](const std::vector<std::string> &fields) {
+    if (fields.size() != schema.names.size()) return false;
     ++schema.rows;
-    for (size_t i = 0; i < row.size(); ++i) {
-      const auto incoming = classify_csv_value(row[i]);
+    for (size_t i = 0; i < fields.size(); ++i) {
+      const auto incoming = classify_csv_value(fields[i]);
+      if (incoming == FileCsvSchema::Kind::UNKNOWN) schema.nullable[i] = true;
+      if (incoming == FileCsvSchema::Kind::DATETIME && fields[i].size() > 19) {
+        const int8_t scale = static_cast<int8_t>(fields[i].size() - 20);
+        if (scale > schema.datetime_scales[i]) schema.datetime_scales[i] = scale;
+      }
       auto &current = schema.kinds[i];
       if (incoming == FileCsvSchema::Kind::UNKNOWN) continue;
       if (current == FileCsvSchema::Kind::UNKNOWN) current = incoming;
@@ -261,8 +307,16 @@ inline FileCsvScan::Status infer_csv_schema(FileCsvScan &scan, FileCsvSchema &sc
       else if ((current == FileCsvSchema::Kind::BIGINT && incoming == FileCsvSchema::Kind::DOUBLE) ||
                (current == FileCsvSchema::Kind::DOUBLE && incoming == FileCsvSchema::Kind::BIGINT))
         current = FileCsvSchema::Kind::DOUBLE;
+      else if ((current == FileCsvSchema::Kind::DATE && incoming == FileCsvSchema::Kind::DATETIME) ||
+               (current == FileCsvSchema::Kind::DATETIME && incoming == FileCsvSchema::Kind::DATE))
+        current = FileCsvSchema::Kind::DATETIME;
       else current = FileCsvSchema::Kind::VARCHAR;
     }
+    return true;
+  };
+  if (!header && !accept_row(row)) return FileCsvScan::Status::INVALID;
+  while ((status = scan.next(row)) == FileCsvScan::Status::OK) {
+    if (!accept_row(row)) return FileCsvScan::Status::INVALID;
   }
   if (status != FileCsvScan::Status::END) return status;
   for (auto &kind : schema.kinds)
@@ -277,11 +331,12 @@ inline FileCsvScan::Status infer_csv_schema(const std::string &path, FileCsvSche
   return status == FileCsvScan::Status::OK ? infer_csv_schema(scan, schema) : status;
 }
 
-inline FileCsvScan::Status infer_csv_schema_fd(int fd, FileCsvSchema &schema)
+inline FileCsvScan::Status infer_csv_schema_fd(int fd, FileCsvSchema &schema,
+                                              bool header = true)
 {
   FileCsvScan scan;
   const auto status = scan.open_fd(fd);
-  return status == FileCsvScan::Status::OK ? infer_csv_schema(scan, schema) : status;
+  return status == FileCsvScan::Status::OK ? infer_csv_schema(scan, schema, header) : status;
 }
 
 } // namespace sql

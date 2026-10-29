@@ -204,6 +204,8 @@ public:
   int resolve_joined_table(const ParseNode &parse_node, JoinedTable *&joined_table);
   int resolve_joined_table_item(const ParseNode &parse_node, JoinedTable *&joined_table);
   int resolve_file_csv_table_item(const ParseNode &table_node, TableItem *&table_item);
+  int resolve_file_csv_options(const ParseNode &options, bool &header,
+                               bool &header_seen, bool &sample_seen);
   int resolve_function_table_item(const ParseNode &table_node,
                                   TableItem *&table_item);
   int resolve_json_table_item(const ParseNode &table_node,

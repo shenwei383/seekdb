@@ -33,12 +33,14 @@ class ObFunctionTableSpec : public ObOpSpec
 OB_UNIS_VERSION_V(1);
 public:
   ObFunctionTableSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
-    : ObOpSpec(alloc, type), value_expr_(nullptr), column_exprs_(alloc), has_correlated_expr_(false), file_csv_(false)
+    : ObOpSpec(alloc, type), value_expr_(nullptr), column_exprs_(alloc), has_correlated_expr_(false), file_csv_(false), file_csv_header_(true), file_csv_describe_(false)
   {}
   ObExpr *value_expr_;
   common::ObFixedArray<ObExpr*, common::ObIAllocator> column_exprs_;
   bool has_correlated_expr_;
   bool file_csv_;
+  bool file_csv_header_;
+  bool file_csv_describe_;
 };
 
 class ObFunctionTableOp : public ObOperator
@@ -51,7 +53,7 @@ public:
     row_count_(0),
     col_count_(0),
     value_table_(NULL),
-    csv_scan_(), csv_row_()
+    csv_scan_(), csv_row_(), csv_first_row_pending_(false)
   {}
 
   virtual int inner_open() override;
@@ -64,6 +66,7 @@ private:
   int inner_get_next_row_udf();
   int inner_get_next_row_sys_func();
   int inner_get_next_row_csv();
+  int inner_get_next_row_csv_metadata();
   int open_csv();
   int get_current_result(common::ObObj &result);
   int64_t node_idx_;
@@ -74,6 +77,8 @@ private:
   pl::ObPLCollection *value_table_;
   FileCsvScan csv_scan_;
   std::vector<std::string> csv_row_;
+  FileCsvSchema csv_metadata_schema_;
+  bool csv_first_row_pending_;
   int (ObFunctionTableOp::*next_row_func_)();
 };
 

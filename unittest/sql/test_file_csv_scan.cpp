@@ -19,6 +19,7 @@ using oceanbase::sql::FileCsvScan;
 using oceanbase::sql::FileCsvSchema;
 using oceanbase::sql::infer_csv_schema_fd;
 using oceanbase::sql::open_secure_csv_fd;
+using oceanbase::sql::classify_csv_value;
 
 static long peak_rss_kb()
 {
@@ -47,8 +48,14 @@ int main()
     other << "private\n";
   }
   FileCsvSchema schema;
+  assert(classify_csv_value("2024-02-29") == FileCsvSchema::Kind::DATE);
+  assert(classify_csv_value("2025-02-29") == FileCsvSchema::Kind::VARCHAR);
+  assert(classify_csv_value("2026-08-03T12:13:14") == FileCsvSchema::Kind::DATETIME);
+  assert(classify_csv_value("2026-08-03 25:13:14") == FileCsvSchema::Kind::VARCHAR);
   assert(infer_csv_schema_fd(open_secure_csv_fd(root, csv), schema) == FileCsvScan::Status::OK);
   assert(schema.rows == 2 && schema.names.size() == 2);
+  assert(infer_csv_schema_fd(open_secure_csv_fd(root, csv), schema, false) == FileCsvScan::Status::OK);
+  assert(schema.rows == 3 && schema.names[0] == "column0");
   {
     FileCsvScan scan;
     assert(scan.open_fd(open_secure_csv_fd(root, csv)) == FileCsvScan::Status::OK);
